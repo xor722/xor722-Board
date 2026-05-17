@@ -1,3 +1,4 @@
+
 # 📟 NFC / RFID Reader — XOR722 X3 Board
 
 Program pembaca kartu NFC/RFID menggunakan board **XOR722 X3** + modul **PN532** via I2C. Hasil pembacaan ditampilkan langsung di layar TFT bawaan board.
@@ -54,3 +55,4 @@ Install via Arduino IDE Library Manager:
 4. Buka Serial Monitor (115200 baud) untuk melihat log
 
 ---
+<img width="845" height="1078" alt="circuit_image" src="https://github.com/user-attachments/assets/a9907756-23be-41bc-8cc4-d851f6debd39" />
