@@ -916,7 +916,7 @@
 //  CONFIG — Update REPO_OWNER and REPO_NAME to match your GitHub
 // ══════════════════════════════════════════════════════════════
 const REPO_OWNER = 'xor722';        
-const REPO_NAME  = 'xor722-board';  
+const REPO_NAME  = 'xor722-board'; 
 const BRANCH     = 'main';
 const FIRMWARE_FOLDER = 'firmware';
 const GITHUB_RAW = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${BRANCH}`;
@@ -950,28 +950,56 @@ function hideAllModals() {
 // ══════════════════════════════════════════════════════════════
 //  GITHUB API — load firmware folders
 // ══════════════════════════════════════════════════════════════
+// ── CACHE HELPERS (localStorage, TTL 30 menit) ──────────────
+const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_KEY = `xor722_fw_${REPO_OWNER}_${REPO_NAME}_${BRANCH}`;
+
+function cacheSet(data) {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data }));
+  } catch(_) {}
+}
+
+function cacheGet() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    const { ts, data } = JSON.parse(raw);
+    if (Date.now() - ts > CACHE_TTL) { localStorage.removeItem(CACHE_KEY); return null; }
+    return data;
+  } catch(_) { return null; }
+}
+
+function cacheClear() {
+  try { localStorage.removeItem(CACHE_KEY); } catch(_) {}
+}
+
+// ── FETCH WITH RATE-LIMIT AWARENESS ──────────────────────────
 async function fetchJSON(url) {
   const r = await fetch(url);
+  if (r.status === 403) {
+    const reset = r.headers.get('X-RateLimit-Reset');
+    const waitMin = reset ? Math.ceil((reset * 1000 - Date.now()) / 60000) : 60;
+    throw new Error(`GitHub API rate limit hit (403). Wait ~${waitMin} min or add a GitHub token. Cached data will be used if available.`);
+  }
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
 async function loadFirmware() {
-  try {
-    const items = await fetchJSON(`${GITHUB_API}/${FIRMWARE_FOLDER}?ref=${BRANCH}`);
-    const folders = items.filter(i => i.type === 'dir');
-
-    if (folders.length === 0) {
-      throw new Error('No firmware folders found in /firmware directory.');
-    }
-
-    const results = await Promise.allSettled(folders.map(f => loadFirmwareFolder(f)));
-    firmwareList = results
-      .filter(r => r.status === 'fulfilled')
-      .map(r => r.value);
-
-    setStatus('FIRMWARE INDEX LOADED', `${firmwareList.length} FIRMWARE(S) AVAILABLE`);
+  // Try cache first
+  const cached = cacheGet();
+  if (cached && cached.length > 0) {
+    firmwareList = cached;
+    setStatus('FIRMWARE INDEX LOADED (CACHED)', `${firmwareList.length} FIRMWARE(S) AVAILABLE`);
     renderList();
+    // Refresh in background silently
+    refreshFirmwareBackground();
+    return;
+  }
+
+  try {
+    await fetchAndRenderFirmware();
   } catch (err) {
     setStatus('CONNECTION ERROR', '');
     const list = document.getElementById('firmware-list');
@@ -981,11 +1009,35 @@ async function loadFirmware() {
         <div class="error-msg">FAILED TO LOAD FIRMWARE INDEX</div>
         <div class="error-hint">
           ${err.message}<br><br>
-          Make sure REPO_OWNER and REPO_NAME are set correctly in the script.<br>
-          Current target: <strong>${REPO_OWNER}/${REPO_NAME}</strong>
+          <strong>GitHub API allows 60 requests/hour without a token.</strong><br>
+          Wait a few minutes then refresh the page.<br><br>
+          Current target: <strong>${REPO_OWNER}/${REPO_NAME}</strong><br><br>
+          <span style="color:var(--accent);cursor:pointer;text-decoration:underline" onclick="cacheClear();location.reload()">
+            ↺ Clear cache &amp; retry
+          </span>
         </div>
       </div>`;
   }
+}
+
+async function fetchAndRenderFirmware() {
+  const items = await fetchJSON(`${GITHUB_API}/${FIRMWARE_FOLDER}?ref=${BRANCH}`);
+  const folders = items.filter(i => i.type === 'dir');
+
+  if (folders.length === 0) throw new Error('No firmware folders found in /firmware directory.');
+
+  const results = await Promise.allSettled(folders.map(f => loadFirmwareFolder(f)));
+  firmwareList = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+
+  cacheSet(firmwareList);
+  setStatus('FIRMWARE INDEX LOADED', `${firmwareList.length} FIRMWARE(S) AVAILABLE`);
+  renderList();
+}
+
+async function refreshFirmwareBackground() {
+  try {
+    await fetchAndRenderFirmware();
+  } catch(_) {} // Silent fail — cache still works
 }
 
 async function loadFirmwareFolder(folder) {
@@ -1006,7 +1058,6 @@ async function loadFirmwareFolder(folder) {
     try {
       const raw = await fetch(`${GITHUB_RAW}/${FIRMWARE_FOLDER}/${encodeURIComponent(folder.name)}/${readmeFile.name}`);
       const txt = await raw.text();
-      // Strip markdown syntax for display
       readme = txt
         .replace(/#{1,6}\s+/g, '')
         .replace(/\*\*(.*?)\*\*/g, '$1')
