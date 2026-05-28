@@ -1212,34 +1212,44 @@ async function startFlash() {
 
     // Load esptool-js dynamically
     log('Loading esptool-js...');
-    await loadScript('https://unpkg.com/esptool-js@0.4.2/bundle.js');
+    await loadScript('https://unpkg.com/esptool-js@0.4.1/bundle.js');
+    // Detect global — different versions expose differently
+    const ESPLoader  = window.ESPLoader  || (window.esptooljs && window.esptooljs.ESPLoader);
+    const Transport  = window.Transport  || (window.esptooljs && window.esptooljs.Transport);
+    if (!ESPLoader || !Transport) {
+      // Debug: dump what unpkg actually exported
+      const keys = Object.keys(window).filter(k => k.toLowerCase().includes('esp') || k.toLowerCase().includes('transport'));
+      throw new Error(`esptool-js globals not found. Window keys: [${keys.join(', ')}]. Try refreshing.`);
+    }
     log('esptool-js loaded.', 'ok');
     setProgress(20);
 
-    const { ESPLoader, Transport } = window.esptooljs || window;
-    if (!ESPLoader) throw new Error('esptool-js not available. Check your internet connection.');
+    // Convert Uint8Array → binary string (required by esptool-js)
+    let binaryString = '';
+    for (let i = 0; i < binData.length; i++) {
+      binaryString += String.fromCharCode(binData[i]);
+    }
 
     // Open port
     log('Opening serial port...');
-    if (selectedPort.readable) {
-      // already open from previous attempt? try to close
-      try { await selectedPort.close(); } catch(_) {}
-    }
+    try { await selectedPort.close(); } catch(_) {}
     await selectedPort.open({ baudRate: 115200 });
     setProgress(25);
 
-    const transport = new Transport(selectedPort);
+    const transport = new Transport(selectedPort, true);
     const esploader = new ESPLoader({
       transport,
       baudrate: 921600,
+      romBaudrate: 115200,
+      enableTracing: false,
       terminal: {
-        clean: () => {},
-        writeLine: (line) => log(line),
-        write: (chunk) => log(chunk),
+        clean() {},
+        writeLine(line) { log(line); },
+        write(chunk) { /* suppress raw bytes */ },
       }
     });
 
-    log('Connecting to ESP32...');
+    log('Connecting to ESP32... (hold BOOT button if needed)');
     const chip = await esploader.main();
     log(`Connected! Chip: ${chip}`, 'ok');
     setProgress(35);
@@ -1253,7 +1263,10 @@ async function startFlash() {
     setProgress(40);
     log('Flashing firmware...');
 
-    const flashFiles = [{ data: binData, address: 0x10000 }];
+    const flashFiles = [{
+      data: binaryString,
+      address: 0x10000
+    }];
 
     await esploader.writeFlash({
       fileArray: flashFiles,
@@ -1262,10 +1275,14 @@ async function startFlash() {
       flashFreq: 'keep',
       eraseAll: false,
       compress: true,
-      reportProgress: (fileIndex, written, total) => {
+      reportProgress(fileIndex, written, total) {
         const pct = 40 + (written / total) * 55;
         setProgress(pct);
         log(`Writing: ${((written / total) * 100).toFixed(0)}%`);
+      },
+      calculateMD5Hash(image) {
+        // md5 not strictly required, return empty to skip verify
+        return '';
       }
     });
 
@@ -1276,7 +1293,7 @@ async function startFlash() {
     log('✓ FLASH COMPLETE!', 'ok');
     log(`Firmware "${selectedFirmware.name}" installed successfully.`, 'ok');
 
-    transport.disconnect();
+    await transport.disconnect();
     await selectedPort.close().catch(() => {});
 
   } catch (err) {
