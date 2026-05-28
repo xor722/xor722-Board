@@ -1210,30 +1210,60 @@ async function startFlash() {
     log(`Binary downloaded: ${(binData.length / 1024).toFixed(1)} KB`, 'ok');
     setProgress(15);
 
-    // Load esptool-js dynamically
-    log('Loading esptool-js...');
-    await loadScript('https://unpkg.com/esptool-js@0.4.1/bundle.js');
-    // Detect global — different versions expose differently
-    const ESPLoader  = window.ESPLoader  || (window.esptooljs && window.esptooljs.ESPLoader);
-    const Transport  = window.Transport  || (window.esptooljs && window.esptooljs.Transport);
-    if (!ESPLoader || !Transport) {
-      // Debug: dump what unpkg actually exported
-      const keys = Object.keys(window).filter(k => k.toLowerCase().includes('esp') || k.toLowerCase().includes('transport'));
-      throw new Error(`esptool-js globals not found. Window keys: [${keys.join(', ')}]. Try refreshing.`);
+    // Load esptool-js with multiple CDN fallbacks
+    log('Loading esptool-js library...');
+    setProgress(16);
+
+    let ESPLoader, Transport;
+    const ESPTOOL_CDNS = [
+      'https://cdn.jsdelivr.net/npm/esptool-js@0.4.1/bundle.js',
+      'https://unpkg.com/esptool-js@0.4.1/bundle.js',
+      'https://cdn.jsdelivr.net/npm/esptool-js@0.4.3/bundle.js',
+    ];
+
+    let loaded = false;
+    for (const cdn of ESPTOOL_CDNS) {
+      try {
+        log(`Trying CDN: ${cdn.includes('jsdelivr') ? 'jsDelivr' : 'unpkg'} v${cdn.match(/esptool-js@([^/]+)/)[1]}...`);
+        await loadScriptGlobal(cdn);
+        ESPLoader = window.ESPLoader || (window.esptooljs && window.esptooljs.ESPLoader) || (window.esptool && window.esptool.ESPLoader);
+        Transport = window.Transport || (window.esptooljs && window.esptooljs.Transport) || (window.esptool && window.esptool.Transport);
+        if (ESPLoader && Transport) { loaded = true; log(`esptool-js loaded OK.`, 'ok'); break; }
+      } catch(e) { log(`CDN failed, trying next...`, 'warn'); }
     }
-    log('esptool-js loaded.', 'ok');
+
+    if (!loaded) {
+      try {
+        log('Trying dynamic ES module import...');
+        const mod = await import('https://cdn.jsdelivr.net/npm/esptool-js@0.4.1/bundle.js');
+        ESPLoader = mod.ESPLoader || (mod.default && mod.default.ESPLoader);
+        Transport = mod.Transport || (mod.default && mod.default.Transport);
+        if (ESPLoader && Transport) { loaded = true; log('Loaded via ES module.', 'ok'); }
+      } catch(e) { log('ES module import failed.', 'warn'); }
+    }
+
+    if (!loaded || !ESPLoader || !Transport) {
+      throw new Error(
+        'Cannot load esptool-js from any CDN. Possible causes:\n' +
+        '• Ad-blocker or browser extension blocking scripts\n' +
+        '• Try opening in Chrome Incognito mode\n' +
+        '• Check internet connection'
+      );
+    }
     setProgress(20);
 
-    // Convert Uint8Array → binary string (required by esptool-js)
+    // Convert Uint8Array → binary string in chunks (fast, non-blocking)
+    log('Preparing binary data...');
     let binaryString = '';
-    for (let i = 0; i < binData.length; i++) {
-      binaryString += String.fromCharCode(binData[i]);
+    const CHUNK = 8192;
+    for (let i = 0; i < binData.length; i += CHUNK) {
+      binaryString += String.fromCharCode(...binData.subarray(i, i + CHUNK));
     }
+    log('Binary ready: ' + (binaryString.length / 1024).toFixed(1) + ' KB');
 
-    // Open port
-    log('Opening serial port...');
-    try { await selectedPort.close(); } catch(_) {}
-    await selectedPort.open({ baudRate: 115200 });
+    // Transport opens the port internally — do NOT call selectedPort.open() manually
+    // Just pass the port object directly to Transport
+    log('Initializing transport...');
     setProgress(25);
 
     const transport = new Transport(selectedPort, true);
@@ -1244,79 +1274,90 @@ async function startFlash() {
       enableTracing: false,
       terminal: {
         clean() {},
-        writeLine(line) { log(line); },
-        write(chunk) { /* suppress raw bytes */ },
+        writeLine(line) { if (line && line.trim()) log(line); },
+        write(chunk) {},
       }
     });
 
-    log('Connecting to ESP32... (hold BOOT button if needed)');
+    log('Connecting to ESP32...', 'warn');
+    log('(Hold BOOT/IO0 button if stuck on connecting)');
     const chip = await esploader.main();
     log(`Connected! Chip: ${chip}`, 'ok');
     setProgress(35);
 
     if (eraseDevice) {
-      log('Erasing flash memory...', 'warn');
+      log('Erasing entire flash...', 'warn');
       await esploader.eraseFlash();
-      log('Flash erased!', 'ok');
+      log('Flash erase complete.', 'ok');
     }
 
     setProgress(40);
-    log('Flashing firmware...');
+    log(`Writing ${selectedFirmware.binFile}...`);
 
-    const flashFiles = [{
-      data: binaryString,
-      address: 0x10000
-    }];
-
+    log('Flash address: 0x0 (Arduino merged binary)');
     await esploader.writeFlash({
-      fileArray: flashFiles,
+      fileArray: [{ data: binaryString, address: 0x0 }],
       flashSize: 'keep',
-      flashMode: 'keep',
-      flashFreq: 'keep',
+      flashMode: 'dio',
+      flashFreq: '80m',
       eraseAll: false,
       compress: true,
       reportProgress(fileIndex, written, total) {
         const pct = 40 + (written / total) * 55;
         setProgress(pct);
-        log(`Writing: ${((written / total) * 100).toFixed(0)}%`);
+        if (written === total || written % Math.floor(total / 8) < 2048) {
+          log(`Writing: ${((written/total)*100).toFixed(0)}% (${(written/1024).toFixed(0)}/${(total/1024).toFixed(0)} KB)`);
+        }
       },
-      calculateMD5Hash(image) {
-        // md5 not strictly required, return empty to skip verify
-        return '';
-      }
+      calculateMD5Hash() { return ''; }
     });
 
-    setProgress(98);
-    log('Resetting device...', 'warn');
+    setProgress(97);
+    log('Resetting ESP32...');
     await esploader.hardReset();
     setProgress(100);
-    log('✓ FLASH COMPLETE!', 'ok');
-    log(`Firmware "${selectedFirmware.name}" installed successfully.`, 'ok');
+    log('━━━━━━━━━━━━━━━━━━━━━━━', 'ok');
+    log('✓  FLASH COMPLETE!', 'ok');
+    log(`✓  ${selectedFirmware.name} installed.`, 'ok');
+    log('━━━━━━━━━━━━━━━━━━━━━━━', 'ok');
 
-    await transport.disconnect();
-    await selectedPort.close().catch(() => {});
+    // Proper cleanup — transport.disconnect() handles port closing
+    try { await transport.disconnect(); } catch(_) {}
+    // Force release any lingering streams
+    selectedPort = null;
 
   } catch (err) {
     log(`ERROR: ${err.message}`, 'err');
-    log('Flash failed. Please try again.', 'err');
-    try { await selectedPort.close(); } catch(_) {}
+    log('─────────────────────────', 'err');
+    log('Flash failed. Disconnect and reconnect ESP32, then try again.', 'err');
+    // Force cleanup on error
+    try { await transport?.disconnect(); } catch(_) {}
+    selectedPort = null;
   } finally {
     doneBtn.classList.add('visible');
   }
 }
 
-function loadScript(src) {
+function loadScriptGlobal(src) {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
-    const s = document.createElement('script');
+    const old = document.querySelector(`script[src="${src}"]`);
+    if (old) old.remove();
+    const s = document.createElement("script");
     s.src = src;
-    s.onload = resolve;
-    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    s.crossOrigin = "anonymous";
+    s.onload = () => setTimeout(resolve, 150);
+    s.onerror = () => reject(new Error("Script load failed: " + src));
     document.head.appendChild(s);
   });
 }
 
-document.getElementById('btn-done').addEventListener('click', hideAllModals);
+document.getElementById('btn-done').addEventListener('click', () => {
+  // Reset port so user must re-select after each flash
+  selectedPort = null;
+  const sel = document.getElementById('port-select');
+  sel.innerHTML = '<option value="">— Click ⟳ to select port again —</option>';
+  hideAllModals();
+});
 
 // Close modals on overlay click (outside modal box)
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
